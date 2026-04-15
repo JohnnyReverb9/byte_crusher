@@ -19,8 +19,9 @@ type AppState struct {
 	filePath     string
 	originalData []byte
 	currentData  []byte
-	hexView      *tview.TextView
+	hexTable     *tview.Table
 	app          *tview.Application
+	pages        *tview.Pages
 	statusLine   *tview.TextView
 }
 
@@ -35,18 +36,19 @@ func RunTUI(filePath string) error {
 		originalData: append([]byte{}, data...),
 		currentData:  append([]byte{}, data...),
 		app:          tview.NewApplication(),
+		pages:        tview.NewPages(),
 	}
 
-	state.hexView = tview.NewTextView().
-		SetDynamicColors(true).
-		SetRegions(true).
-		SetWrap(false).
-		SetScrollable(true)
-	state.hexView.SetBorder(true).SetTitle(fmt.Sprintf(" Hex Dump - %s ", filePath))
+	state.hexTable = tview.NewTable().
+		SetBorders(false).
+		SetSelectable(true, true).
+		SetFixed(1, 1) // fix address col? wait, we don't have header row nicely done, just values. SetFixed(0,0) is fine.
+		
+	state.hexTable.SetBorder(true).SetTitle(fmt.Sprintf(" Hex Table - %s ", filePath))
 
 	state.statusLine = tview.NewTextView().SetDynamicColors(true)
 	state.statusLine.SetBorder(true)
-	state.setStatus("App loaded successfully")
+	state.setStatus("App loaded successfully. Press 'Enter' on a byte to edit, 'Del' to remove row, 'R' to replace row.")
 
 	sidePanel := tview.NewFlex().SetDirection(tview.FlexRow)
 	sidePanel.SetBorder(true).SetTitle(" Operations Panel ")
@@ -58,7 +60,7 @@ func RunTUI(filePath string) error {
 	replaceForm.AddButton("Replace", func() {
 		fromStr := replaceForm.GetFormItemByLabel("Find (Hex)").(*tview.InputField).GetText()
 		toStr := replaceForm.GetFormItemByLabel("Replace (Hex)").(*tview.InputField).GetText()
-		
+
 		fromStr = strings.ReplaceAll(fromStr, " ", "")
 		toStr = strings.ReplaceAll(toStr, " ", "")
 
@@ -76,7 +78,7 @@ func RunTUI(filePath string) error {
 		}
 
 		state.currentData = crusher.ReplacePattern(state.currentData, safeHeaderSize, from, to)
-		state.updateHexView()
+		state.updateHexTable()
 		state.setStatus(fmt.Sprintf("[green]Replaced %s with %s", fromStr, toStr))
 	})
 	replaceForm.SetTitle(" Replace bytes ").SetBorder(true)
@@ -94,7 +96,7 @@ func RunTUI(filePath string) error {
 		}
 
 		crusher.Corrupt(state.currentData, safeHeaderSize, sev)
-		state.updateHexView()
+		state.updateHexTable()
 		state.setStatus(fmt.Sprintf("[green]Corrupted %.2f%% of data", sev*100))
 	})
 	corruptForm.SetTitle(" Byte Corruption ").SetBorder(true)
@@ -104,7 +106,7 @@ func RunTUI(filePath string) error {
 	globalForm := tview.NewForm()
 	globalForm.AddButton("Reset", func() {
 		state.currentData = append([]byte{}, state.originalData...)
-		state.updateHexView()
+		state.updateHexTable()
 		state.setStatus("[yellow]Reset to original file")
 	})
 	globalForm.AddButton("Save File", func() {
@@ -123,36 +125,241 @@ func RunTUI(filePath string) error {
 	sidePanel.AddItem(globalForm, 0, 1, false)
 
 	// --- Layout Setup ---
-	flex := tview.NewFlex().
-		AddItem(state.hexView, 0, 3, false).
+	mainFlex := tview.NewFlex().
+		AddItem(state.hexTable, 0, 3, true).
 		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
-			AddItem(sidePanel, 0, 8, true).
-			AddItem(state.statusLine, 3, 1, false), 0, 1, true)
+			AddItem(sidePanel, 0, 8, false).
+			AddItem(state.statusLine, 3, 1, false), 0, 1, false)
 
-	state.app.SetRoot(flex, true).EnableMouse(true)
+	state.pages.AddPage("main", mainFlex, true, true)
+	state.app.SetRoot(state.pages, true).EnableMouse(true)
+
+	// App-level global shortcuts (Tab switching)
 	state.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyCtrlQ {
 			state.app.Stop()
 			return nil
 		}
 		if event.Key() == tcell.KeyTab {
-			state.app.SetFocus(flex) // rudimentary cycle focus, tview handles form tabs naturally
+			// Extremely simple toggle focus between table and sidepanel
+			if state.hexTable.HasFocus() {
+				state.app.SetFocus(sidePanel)
+			} else {
+				state.app.SetFocus(state.hexTable)
+			}
+			return nil
 		}
 		return event
 	})
 
-	state.updateHexView()
+	// Table-specific interactive shortcuts
+	state.hexTable.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		row, col := state.hexTable.GetSelection()
+		if col < 1 || col > 16 {
+			// Jump column if they are on borders
+			if event.Key() == tcell.KeyLeft && col > 1 {
+				state.hexTable.Select(row, 16)
+				return nil
+			} else if event.Key() == tcell.KeyRight && col < 17 {
+				state.hexTable.Select(row, 1)
+				return nil
+			}
+			return event // pass through if not on a byte column
+		}
+		
+		byteIndex := row*16 + (col - 1)
+		
+		isProtected := byteIndex < safeHeaderSize
+		wantsModify := event.Key() == tcell.KeyEnter || event.Key() == tcell.KeyBackspace || event.Key() == tcell.KeyDelete || event.Key() == tcell.KeyBackspace2 || event.Rune() == 'R' || event.Rune() == 'r'
+		
+		if isProtected && wantsModify {
+			state.setStatus("[red]Cannot modify header bytes manually! Security lock is active.")
+			return nil // block
+		}
+
+		if byteIndex >= len(state.currentData) {
+			return event
+		}
+
+		// Edit single byte
+		if event.Key() == tcell.KeyEnter {
+			currentByteStr := fmt.Sprintf("%02x", state.currentData[byteIndex])
+			state.showInputModal(fmt.Sprintf("Edit Byte at %08x", byteIndex), "New Hex Value:", currentByteStr, func(newVal string) {
+				newVal = strings.TrimSpace(newVal)
+				b, err := hex.DecodeString(newVal)
+				if err != nil || len(b) != 1 {
+					state.setStatus("[red]Invalid hex format. Must be exactly 1 byte (e.g. FF)")
+					return
+				}
+				state.currentData[byteIndex] = b[0]
+				state.updateHexTable()
+				state.hexTable.Select(row, col)
+				state.setStatus(fmt.Sprintf("[green]Updated byte to %02x", b[0]))
+			})
+			return nil
+		}
+
+		// Delete Row
+		if event.Key() == tcell.KeyBackspace || event.Key() == tcell.KeyDelete || event.Key() == tcell.KeyBackspace2 {
+			startIdx := row * 16
+			if startIdx < safeHeaderSize {
+				state.setStatus("[red]Cannot delete row in protected header territory!")
+				return nil
+			}
+			endIdx := startIdx + 16
+			if endIdx > len(state.currentData) {
+				endIdx = len(state.currentData)
+			}
+			
+			state.currentData = append(state.currentData[:startIdx], state.currentData[endIdx:]...)
+			state.updateHexTable()
+			
+			// Adjust cursor if row deleted
+			if row >= state.hexTable.GetRowCount() {
+				row = state.hexTable.GetRowCount() - 1
+			}
+			if row < 0 {
+				row = 0
+			}
+			state.hexTable.Select(row, col)
+			state.setStatus(fmt.Sprintf("[yellow]Deleted row at address %08x", startIdx))
+			return nil
+		}
+
+		// Replace Row
+		if event.Rune() == 'R' || event.Rune() == 'r' {
+			startIdx := row * 16
+			endIdx := startIdx + 16
+			if endIdx > len(state.currentData) {
+				endIdx = len(state.currentData)
+			}
+			
+			existingHex := hex.EncodeToString(state.currentData[startIdx:endIdx])
+			
+			state.showInputModal(fmt.Sprintf("Replace %d bytes starting %08x", endIdx-startIdx, startIdx), "New Sequence (Hex):", existingHex, func(newVal string) {
+				newVal = strings.ReplaceAll(newVal, " ", "")
+				b, err := hex.DecodeString(newVal)
+				if err != nil {
+					state.setStatus("[red]Invalid hex string provided.")
+					return
+				}
+				
+				var newData []byte
+				newData = append(newData, state.currentData[:startIdx]...)
+				newData = append(newData, b...)
+				newData = append(newData, state.currentData[endIdx:]...)
+				
+				state.currentData = newData
+				state.updateHexTable()
+				state.hexTable.Select(row, col)
+				state.setStatus(fmt.Sprintf("[green]Replaced row data successfully! Row now has %d bytes.", len(b)))
+			})
+			return nil
+		}
+
+		return event
+	})
+
+	state.updateHexTable()
 
 	return state.app.Run()
 }
 
-func (s *AppState) updateHexView() {
-	// Rendering a max of 2000 lines (32KB approx) to prevent UI lag on huge files
-	hexStr := crusher.HexDumpColored(s.currentData, safeHeaderSize, 2000)
-	s.hexView.SetText(hexStr)
-	s.hexView.ScrollToBeginning()
+func (s *AppState) showInputModal(title, label, initialValue string, onOk func(text string)) {
+	form := tview.NewForm().
+		AddInputField(label, initialValue, 32, nil, nil)
+	
+	form.AddButton("OK", func() {
+		val := form.GetFormItemByLabel(label).(*tview.InputField).GetText()
+		s.pages.RemovePage("modal")
+		s.app.SetFocus(s.hexTable)
+		onOk(val)
+	}).
+	AddButton("Cancel", func() {
+		s.pages.RemovePage("modal")
+		s.app.SetFocus(s.hexTable)
+	})
+	
+	form.SetBorder(true).SetTitle(" " + title + " ")
+
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(form, 10, 1, true).
+			AddItem(nil, 0, 1, false), 40, 1, true).
+		AddItem(nil, 0, 1, false)
+
+	s.pages.AddPage("modal", modal, true, true)
+	s.app.SetFocus(form)
+}
+
+func (s *AppState) updateHexTable() {
+	s.hexTable.Clear()
+	maxLines := 2048
+	
+	bytesPerLine := 16
+	lines := len(s.currentData) / bytesPerLine
+	if len(s.currentData)%bytesPerLine != 0 {
+		lines++
+	}
+
+	if lines > maxLines {
+		lines = maxLines
+	}
+
+	for line := 0; line < lines; line++ {
+		start := line * bytesPerLine
+		end := start + bytesPerLine
+		if end > len(s.currentData) {
+			end = len(s.currentData)
+		}
+		
+		// Col 0: Address
+		addrCell := tview.NewTableCell(fmt.Sprintf("%08x ", start)).
+			SetTextColor(tcell.ColorYellow).
+			SetSelectable(false).
+			SetAlign(tview.AlignRight)
+		s.hexTable.SetCell(line, 0, addrCell)
+
+		// Col 1-16: Bytes
+		for i := start; i < start+bytesPerLine; i++ {
+			c := i - start + 1
+			if i < len(s.currentData) {
+				color := tcell.ColorGreen
+				if i < safeHeaderSize {
+					color = tcell.ColorGray
+				}
+				cell := tview.NewTableCell(fmt.Sprintf("%02x", s.currentData[i])).
+					SetTextColor(color).
+					SetSelectable(true).
+					SetAlign(tview.AlignCenter)
+				s.hexTable.SetCell(line, c, cell)
+			} else {
+				cell := tview.NewTableCell("  ").SetSelectable(false)
+				s.hexTable.SetCell(line, c, cell)
+			}
+		}
+
+		// Col 17: ASCII
+		asciiStr := " | "
+		for i := start; i < end; i++ {
+			c := s.currentData[i]
+			if c >= 32 && c <= 126 {
+				asciiStr += string(c)
+			} else {
+				asciiStr += "."
+			}
+		}
+		
+		asciiCell := tview.NewTableCell(asciiStr).
+			SetTextColor(tcell.ColorWhite).
+			SetSelectable(false).
+			SetAlign(tview.AlignLeft)
+		s.hexTable.SetCell(line, 17, asciiCell)
+	}
 }
 
 func (s *AppState) setStatus(msg string) {
-	s.statusLine.SetText(fmt.Sprintf(" Status: %s\n Header Protection: First %d bytes locked.", msg, safeHeaderSize))
+	s.statusLine.SetText(fmt.Sprintf(" Status: %s\n Header Protection: %d bytes.", msg, safeHeaderSize))
 }
