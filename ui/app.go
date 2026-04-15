@@ -25,30 +25,49 @@ type AppState struct {
 	statusLine   *tview.TextView
 }
 
-func RunTUI(filePath string) error {
-	data, err := ioutil.ReadFile(filePath)
+func (s *AppState) loadFile(path string) error {
+	data, err := ioutil.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("could not read file: %w", err)
+		return err
+	}
+	s.filePath = path
+	s.originalData = append([]byte{}, data...)
+	s.currentData = append([]byte{}, data...)
+	return nil
+}
+
+func RunTUI(initialFilePath string) error {
+	state := &AppState{
+		app:   tview.NewApplication(),
+		pages: tview.NewPages(),
 	}
 
-	state := &AppState{
-		filePath:     filePath,
-		originalData: append([]byte{}, data...),
-		currentData:  append([]byte{}, data...),
-		app:          tview.NewApplication(),
-		pages:        tview.NewPages(),
+	if initialFilePath != "" {
+		err := state.loadFile(initialFilePath)
+		if err != nil {
+			return err
+		}
 	}
 
 	state.hexTable = tview.NewTable().
 		SetBorders(false).
 		SetSelectable(true, true).
-		SetFixed(1, 1) // fix address col? wait, we don't have header row nicely done, just values. SetFixed(0,0) is fine.
-		
-	state.hexTable.SetBorder(true).SetTitle(fmt.Sprintf(" Hex Table - %s ", filePath))
+		SetFixed(0, 0)
+
+	title := " No File Loaded (Press Open) "
+	if state.filePath != "" {
+		title = fmt.Sprintf(" Hex Table - %s ", state.filePath)
+	}
+	state.hexTable.SetBorder(true).SetTitle(title)
 
 	state.statusLine = tview.NewTextView().SetDynamicColors(true)
 	state.statusLine.SetBorder(true)
-	state.setStatus("App loaded successfully. Press 'Enter' on a byte to edit, 'Del' to remove row, 'R' to replace row.")
+
+	if state.filePath != "" {
+		state.setStatus("App loaded successfully. Press 'Enter' on a byte to edit, 'Del' to remove row, 'R' to replace row.")
+	} else {
+		state.setStatus("Welcome to Byte Crusher! Please click 'Open File' to begin.")
+	}
 
 	sidePanel := tview.NewFlex().SetDirection(tview.FlexRow)
 	sidePanel.SetBorder(true).SetTitle(" Operations Panel ")
@@ -58,6 +77,10 @@ func RunTUI(filePath string) error {
 	replaceForm.AddInputField("Find (Hex)", "", 10, nil, nil)
 	replaceForm.AddInputField("Replace (Hex)", "", 10, nil, nil)
 	replaceForm.AddButton("Replace", func() {
+		if state.filePath == "" {
+			state.setStatus("[red]No file loaded!")
+			return
+		}
 		fromStr := replaceForm.GetFormItemByLabel("Find (Hex)").(*tview.InputField).GetText()
 		toStr := replaceForm.GetFormItemByLabel("Replace (Hex)").(*tview.InputField).GetText()
 
@@ -88,6 +111,10 @@ func RunTUI(filePath string) error {
 	corruptForm := tview.NewForm()
 	corruptForm.AddInputField("Severity (0.01-1.0)", "0.05", 10, nil, nil)
 	corruptForm.AddButton("Corrupt", func() {
+		if state.filePath == "" {
+			state.setStatus("[red]No file loaded!")
+			return
+		}
 		sevStr := corruptForm.GetFormItemByLabel("Severity (0.01-1.0)").(*tview.InputField).GetText()
 		sev, err := strconv.ParseFloat(sevStr, 64)
 		if err != nil {
@@ -102,14 +129,71 @@ func RunTUI(filePath string) error {
 	corruptForm.SetTitle(" Byte Corruption ").SetBorder(true)
 	sidePanel.AddItem(corruptForm, 7, 1, false)
 
-	// --- Global Actions Form ---
-	globalForm := tview.NewForm()
-	globalForm.AddButton("Reset", func() {
+	// --- Edit Actions Form ---
+	editForm := tview.NewForm()
+	editForm.AddButton("Jump (Hex)", func() {
+		if state.filePath == "" {
+			return
+		}
+		state.showInputModal("Jump to Offset", "Target Hex (e.g. 1a0):", "", func(newVal string) {
+			newVal = strings.TrimSpace(newVal)
+			newVal = strings.TrimPrefix(newVal, "0x")
+			addr, err := strconv.ParseInt(newVal, 16, 64)
+			if err != nil {
+				state.setStatus("[red]Invalid hex address format")
+				return
+			}
+			row := int(addr / 16)
+			if row < 0 {
+				row = 0
+			}
+			if row >= state.hexTable.GetRowCount() {
+				row = state.hexTable.GetRowCount() - 1
+			}
+			if row < 0 {
+				row = 0
+			}
+			state.hexTable.Select(row, 1)
+		})
+	})
+	editForm.AddButton("Reset Mod", func() {
+		if state.filePath == "" {
+			return
+		}
 		state.currentData = append([]byte{}, state.originalData...)
 		state.updateHexTable()
+		state.hexTable.ScrollToBeginning()
+		state.hexTable.Select(0, 1)
 		state.setStatus("[yellow]Reset to original file")
 	})
-	globalForm.AddButton("Save File", func() {
+	editForm.SetTitle(" Navigation ").SetBorder(true)
+	sidePanel.AddItem(editForm, 5, 1, false)
+
+	// --- File Actions Form ---
+	fileForm := tview.NewForm()
+	fileForm.AddButton("Open File", func() {
+		state.showInputModal("Open New File", "File Path:", state.filePath, func(newVal string) {
+			newVal = strings.TrimSpace(newVal)
+			if newVal == "" {
+				return
+			}
+			err := state.loadFile(newVal)
+			if err != nil {
+				state.setStatus(fmt.Sprintf("[red]Failed to load: %v", err))
+			} else {
+				state.hexTable.SetTitle(fmt.Sprintf(" Hex Table - %s ", state.filePath))
+				state.updateHexTable()
+				state.hexTable.ScrollToBeginning()
+				state.hexTable.Select(0, 1)
+				state.setStatus(fmt.Sprintf("[green]Successfully loaded %s", state.filePath))
+			}
+		})
+	})
+	fileForm.AddButton("Save File", func() {
+		if state.filePath == "" {
+			state.setStatus("[red]No file loaded to save!")
+			return
+		}
 		err := ioutil.WriteFile(state.filePath, state.currentData, 0644)
 		if err != nil {
 			state.setStatus(fmt.Sprintf("[red]Save failed: %v", err))
@@ -118,11 +202,11 @@ func RunTUI(filePath string) error {
 			state.originalData = append([]byte{}, state.currentData...) // update original
 		}
 	})
-	globalForm.AddButton("Quit", func() {
+	fileForm.AddButton("Quit", func() {
 		state.app.Stop()
 	})
-	globalForm.SetTitle(" Actions ").SetBorder(true)
-	sidePanel.AddItem(globalForm, 0, 1, false)
+	fileForm.SetTitle(" Main Actions ").SetBorder(true)
+	sidePanel.AddItem(fileForm, 0, 1, false)
 
 	// --- Layout Setup ---
 	mainFlex := tview.NewFlex().
@@ -141,7 +225,6 @@ func RunTUI(filePath string) error {
 			return nil
 		}
 		if event.Key() == tcell.KeyTab {
-			// Extremely simple toggle focus between table and sidepanel
 			if state.hexTable.HasFocus() {
 				state.app.SetFocus(sidePanel)
 			} else {
@@ -154,6 +237,10 @@ func RunTUI(filePath string) error {
 
 	// Table-specific interactive shortcuts
 	state.hexTable.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if state.filePath == "" {
+			return event // do nothing if no file
+		}
+
 		row, col := state.hexTable.GetSelection()
 		if col < 1 || col > 16 {
 			// Jump column if they are on borders
@@ -166,12 +253,12 @@ func RunTUI(filePath string) error {
 			}
 			return event // pass through if not on a byte column
 		}
-		
+
 		byteIndex := row*16 + (col - 1)
-		
+
 		isProtected := byteIndex < safeHeaderSize
 		wantsModify := event.Key() == tcell.KeyEnter || event.Key() == tcell.KeyBackspace || event.Key() == tcell.KeyDelete || event.Key() == tcell.KeyBackspace2 || event.Rune() == 'R' || event.Rune() == 'r'
-		
+
 		if isProtected && wantsModify {
 			state.setStatus("[red]Cannot modify header bytes manually! Security lock is active.")
 			return nil // block
@@ -210,10 +297,10 @@ func RunTUI(filePath string) error {
 			if endIdx > len(state.currentData) {
 				endIdx = len(state.currentData)
 			}
-			
+
 			state.currentData = append(state.currentData[:startIdx], state.currentData[endIdx:]...)
 			state.updateHexTable()
-			
+
 			// Adjust cursor if row deleted
 			if row >= state.hexTable.GetRowCount() {
 				row = state.hexTable.GetRowCount() - 1
@@ -233,9 +320,9 @@ func RunTUI(filePath string) error {
 			if endIdx > len(state.currentData) {
 				endIdx = len(state.currentData)
 			}
-			
+
 			existingHex := hex.EncodeToString(state.currentData[startIdx:endIdx])
-			
+
 			state.showInputModal(fmt.Sprintf("Replace %d bytes starting %08x", endIdx-startIdx, startIdx), "New Sequence (Hex):", existingHex, func(newVal string) {
 				newVal = strings.ReplaceAll(newVal, " ", "")
 				b, err := hex.DecodeString(newVal)
@@ -243,12 +330,12 @@ func RunTUI(filePath string) error {
 					state.setStatus("[red]Invalid hex string provided.")
 					return
 				}
-				
+
 				var newData []byte
 				newData = append(newData, state.currentData[:startIdx]...)
 				newData = append(newData, b...)
 				newData = append(newData, state.currentData[endIdx:]...)
-				
+
 				state.currentData = newData
 				state.updateHexTable()
 				state.hexTable.Select(row, col)
@@ -262,24 +349,43 @@ func RunTUI(filePath string) error {
 
 	state.updateHexTable()
 
+	// If launched with no args, show the open file modal immediately
+	if state.filePath == "" {
+		state.showInputModal("Welcome to Byte Crusher", "Enter File Path to Open:", "", func(newVal string) {
+			newVal = strings.TrimSpace(newVal)
+			if newVal != "" {
+				err := state.loadFile(newVal)
+				if err != nil {
+					state.setStatus(fmt.Sprintf("[red]Load failed: %v", err))
+				} else {
+					state.hexTable.SetTitle(fmt.Sprintf(" Hex Table - %s ", state.filePath))
+					state.updateHexTable()
+					state.hexTable.ScrollToBeginning()
+					state.hexTable.Select(0, 1)
+					state.setStatus(fmt.Sprintf("[green]Loaded %s", state.filePath))
+				}
+			}
+		})
+	}
+
 	return state.app.Run()
 }
 
 func (s *AppState) showInputModal(title, label, initialValue string, onOk func(text string)) {
 	form := tview.NewForm().
-		AddInputField(label, initialValue, 32, nil, nil)
-	
+		AddInputField(label, initialValue, 40, nil, nil) // adjusted input to 40 spaces
+
 	form.AddButton("OK", func() {
 		val := form.GetFormItemByLabel(label).(*tview.InputField).GetText()
 		s.pages.RemovePage("modal")
-		s.app.SetFocus(s.hexTable)
 		onOk(val)
+		s.app.SetFocus(s.hexTable) // move focus AFTER ok callback builds the table
 	}).
-	AddButton("Cancel", func() {
-		s.pages.RemovePage("modal")
-		s.app.SetFocus(s.hexTable)
-	})
-	
+		AddButton("Cancel", func() {
+			s.pages.RemovePage("modal")
+			s.app.SetFocus(s.hexTable)
+		})
+
 	form.SetBorder(true).SetTitle(" " + title + " ")
 
 	modal := tview.NewFlex().
@@ -287,7 +393,7 @@ func (s *AppState) showInputModal(title, label, initialValue string, onOk func(t
 		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
 			AddItem(nil, 0, 1, false).
 			AddItem(form, 10, 1, true).
-			AddItem(nil, 0, 1, false), 40, 1, true).
+			AddItem(nil, 0, 1, false), 90, 1, true). // widened modal box to 90 chars
 		AddItem(nil, 0, 1, false)
 
 	s.pages.AddPage("modal", modal, true, true)
@@ -296,8 +402,13 @@ func (s *AppState) showInputModal(title, label, initialValue string, onOk func(t
 
 func (s *AppState) updateHexTable() {
 	s.hexTable.Clear()
+	if s.filePath == "" {
+		s.hexTable.SetCell(0, 0, tview.NewTableCell("No file opened. Use 'Open File' from Actions panel.").SetTextColor(tcell.ColorGray))
+		return
+	}
+
 	maxLines := 2048
-	
+
 	bytesPerLine := 16
 	lines := len(s.currentData) / bytesPerLine
 	if len(s.currentData)%bytesPerLine != 0 {
@@ -314,7 +425,7 @@ func (s *AppState) updateHexTable() {
 		if end > len(s.currentData) {
 			end = len(s.currentData)
 		}
-		
+
 		// Col 0: Address
 		addrCell := tview.NewTableCell(fmt.Sprintf("%08x ", start)).
 			SetTextColor(tcell.ColorYellow).
@@ -351,7 +462,7 @@ func (s *AppState) updateHexTable() {
 				asciiStr += "."
 			}
 		}
-		
+
 		asciiCell := tview.NewTableCell(asciiStr).
 			SetTextColor(tcell.ColorWhite).
 			SetSelectable(false).

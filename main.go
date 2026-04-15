@@ -8,21 +8,13 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Byte Crusher - TUI Hex Editor for File Glitching")
-		fmt.Println("Usage: ")
-		fmt.Println("  go run main.go <file_path>")
-		fmt.Println("Example: ")
-		fmt.Println("  go run main.go ./test_image.jpg")
-		os.Exit(1)
-	}
-
-	filePath := os.Args[1]
-
-	// Check if file exists
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		fmt.Printf("Error: File %s does not exist.\n", filePath)
-		os.Exit(1)
+	var filePath string
+	if len(os.Args) >= 2 {
+		filePath = os.Args[1]
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			fmt.Printf("Error: File %s does not exist.\n", filePath)
+			os.Exit(1)
+		}
 	}
 
 	err := ui.RunTUI(filePath)
